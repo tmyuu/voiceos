@@ -1,6 +1,13 @@
 import { parseLogs } from "./parser.js";
 import { getSessions } from "./db.js";
-import type { AnalysisResult, SessionSequence, VoiceSession } from "./types.js";
+import type {
+  AnalysisResult,
+  SessionSequence,
+  VoiceSession,
+  ModeRetry,
+  AiTransformSession,
+  WindowContext,
+} from "./types.js";
 
 const MODE_NAMES: Record<number, string> = {
   0: "dictate",
@@ -236,4 +243,237 @@ export function getSessionSequences(): SessionSequence[] {
       apps: Array.from(data.apps),
     }))
     .sort((a, b) => b.count - a.count);
+}
+
+// ── Pattern 2: Mode retries (same transcript, different mode within short time) ──
+
+export function detectModeRetries(maxGapSeconds: number = 60): ModeRetry[] {
+  const sessions = getSessions({ limit: 10000 });
+  const sorted = [...sessions].sort(
+    (a, b) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
+
+  const retries: ModeRetry[] = [];
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const curr = sorted[i]!;
+    const next = sorted[i + 1]!;
+
+    if (curr.mode === next.mode) continue;
+    if (!curr.transcript || !next.transcript) continue;
+
+    const gap =
+      (new Date(next.created_at).getTime() -
+        new Date(curr.created_at).getTime()) /
+      1000;
+    if (gap > maxGapSeconds) continue;
+
+    // Check transcript similarity: exact match or one contains the other
+    const t1 = curr.transcript.trim();
+    const t2 = next.transcript.trim();
+    const similar =
+      t1 === t2 ||
+      t1.includes(t2) ||
+      t2.includes(t1) ||
+      (t1.length > 5 &&
+        t2.length > 5 &&
+        levenshteinRatio(t1, t2) > 0.7);
+
+    if (similar) {
+      retries.push({
+        firstSession: {
+          id: curr.id,
+          transcript: curr.transcript,
+          mode: MODE_NAMES[curr.mode] ?? `unknown(${curr.mode})`,
+          created_at: curr.created_at,
+        },
+        retrySession: {
+          id: next.id,
+          transcript: next.transcript,
+          mode: MODE_NAMES[next.mode] ?? `unknown(${next.mode})`,
+          created_at: next.created_at,
+        },
+        gapSeconds: Math.round(gap * 10) / 10,
+        app_name: curr.app_name ?? next.app_name,
+        window_title: curr.window_title ?? next.window_title,
+      });
+    }
+  }
+
+  return retries;
+}
+
+function levenshteinRatio(a: string, b: string): number {
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+
+  const matrix: number[][] = [];
+  for (let i = 0; i <= a.length; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= b.length; j++) {
+    matrix[0]![j] = j;
+  }
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i]![j] = Math.min(
+        matrix[i - 1]![j]! + 1,
+        matrix[i]![j - 1]! + 1,
+        matrix[i - 1]![j - 1]! + cost
+      );
+    }
+  }
+
+  return 1 - matrix[a.length]![b.length]! / maxLen;
+}
+
+// ── Pattern 4: AI transform detection (transcript vs generated_text) ──
+
+export function detectAiTransforms(): {
+  sessions: AiTransformSession[];
+  summary: {
+    passthrough: number;
+    ai_transformed: number;
+    no_output: number;
+    total: number;
+  };
+} {
+  const sessions = getSessions({ limit: 10000 });
+
+  const results: AiTransformSession[] = sessions.map((s) => {
+    let transformType: AiTransformSession["transformType"];
+
+    if (!s.generated_text) {
+      transformType = "no_output";
+    } else if (
+      s.transcript &&
+      s.generated_text.trim() === s.transcript.trim()
+    ) {
+      transformType = "passthrough";
+    } else {
+      transformType = "ai_transformed";
+    }
+
+    return {
+      id: s.id,
+      transcript: s.transcript,
+      generated_text: s.generated_text,
+      app_name: s.app_name,
+      mode: MODE_NAMES[s.mode] ?? `unknown(${s.mode})`,
+      transformType,
+      created_at: s.created_at,
+    };
+  });
+
+  const summary = {
+    passthrough: results.filter((r) => r.transformType === "passthrough").length,
+    ai_transformed: results.filter((r) => r.transformType === "ai_transformed")
+      .length,
+    no_output: results.filter((r) => r.transformType === "no_output").length,
+    total: results.length,
+  };
+
+  return { sessions: results, summary };
+}
+
+// ── Pattern 5: Window title context analysis ──
+
+export function analyzeWindowContexts(): {
+  contexts: WindowContext[];
+  urlPatterns: { pattern: string; count: number; apps: string[] }[];
+} {
+  const sessions = getSessions({ limit: 10000 });
+
+  // Group by app_name + window_title
+  const contextMap = new Map<
+    string,
+    {
+      app_name: string;
+      window_title: string;
+      count: number;
+      modes: Record<string, number>;
+      transcripts: string[];
+    }
+  >();
+
+  for (const s of sessions) {
+    if (!s.app_name || !s.window_title) continue;
+    const key = `${s.app_name}|${s.window_title}`;
+    const existing = contextMap.get(key) ?? {
+      app_name: s.app_name,
+      window_title: s.window_title,
+      count: 0,
+      modes: {},
+      transcripts: [],
+    };
+    existing.count++;
+    const mode = MODE_NAMES[s.mode] ?? `unknown(${s.mode})`;
+    existing.modes[mode] = (existing.modes[mode] ?? 0) + 1;
+    if (s.transcript) {
+      existing.transcripts.push(s.transcript);
+    }
+    contextMap.set(key, existing);
+  }
+
+  const contexts: WindowContext[] = Array.from(contextMap.values())
+    .map((c) => ({
+      app_name: c.app_name,
+      window_title: c.window_title,
+      sessionCount: c.count,
+      modes: c.modes,
+      transcripts: c.transcripts.slice(0, 10),
+    }))
+    .sort((a, b) => b.sessionCount - a.sessionCount);
+
+  // Extract URL patterns from window titles
+  const urlRegex =
+    /(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,})(?:\/[^\s]*)*/g;
+  const urlCounts = new Map<
+    string,
+    { count: number; apps: Set<string> }
+  >();
+
+  for (const s of sessions) {
+    if (!s.window_title) continue;
+    const matches = s.window_title.matchAll(urlRegex);
+    for (const m of matches) {
+      const domain = m[1]!;
+      const existing = urlCounts.get(domain) ?? {
+        count: 0,
+        apps: new Set(),
+      };
+      existing.count++;
+      if (s.app_name) existing.apps.add(s.app_name);
+      urlCounts.set(domain, existing);
+    }
+  }
+
+  // Also extract paths from window titles that look like file paths
+  const pathRegex = /[~\/][\w\-\.\/]+/g;
+  for (const s of sessions) {
+    if (!s.window_title) continue;
+    const matches = s.window_title.matchAll(pathRegex);
+    for (const m of matches) {
+      const path = m[0]!;
+      const existing = urlCounts.get(path) ?? {
+        count: 0,
+        apps: new Set(),
+      };
+      existing.count++;
+      if (s.app_name) existing.apps.add(s.app_name);
+      urlCounts.set(path, existing);
+    }
+  }
+
+  const urlPatterns = Array.from(urlCounts.entries())
+    .map(([pattern, data]) => ({
+      pattern,
+      count: data.count,
+      apps: Array.from(data.apps),
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  return { contexts, urlPatterns };
 }
