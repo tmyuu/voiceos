@@ -54,15 +54,38 @@ export interface SessionSequence {
   apps: string[];
 }
 
-export interface WorkflowSuggestion {
-  toolName: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  rationale: string;
-  confidence: "high" | "medium" | "low";
-  supportingData: {
-    occurrences: number;
-    exampleTranscripts: string[];
-    involvedApps: string[];
+export interface ModeRetry {
+  firstSession: {
+    id: string;
+    transcript: string | null;
+    mode: string;
+    created_at: string;
   };
+  retrySession: {
+    id: string;
+    transcript: string | null;
+    mode: string;
+    created_at: string;
+  };
+  gapSeconds: number;
+  app_name: string | null;
+  window_title: string | null;
+}
+
+export interface AiTransformSession {
+  id: string;
+  transcript: string | null;
+  generated_text: string | null;
+  app_name: string | null;
+  mode: string;
+  transformType: "passthrough" | "ai_transformed" | "no_output";
+  created_at: string;
+}
+
+export interface WindowContext {
+  app_name: string;
+  window_title: string;
+  sessionCount: number;
+  modes: Record<string, number>;
+  transcripts: string[];
 }

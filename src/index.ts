@@ -10,6 +10,9 @@ import {
   getErrorPatterns,
   getSessionDetail,
   getSessionSequences,
+  detectModeRetries,
+  detectAiTransforms,
+  analyzeWindowContexts,
 } from "./analyzer.js";
 
 const server = new McpServer({
@@ -143,6 +146,46 @@ server.tool(
 );
 
 server.tool(
+  "voiceos_mode_retries",
+  "Detect sessions where the user retried the same utterance in a different mode (e.g., dictate then write). Reveals cases where a mode didn't meet expectations, suggesting a tool that bridges the gap.",
+  {
+    max_gap_seconds: z.optional(
+      z.number().describe("Max time gap between sessions to consider a retry (default 60)")
+    ),
+  },
+  async (params) => {
+    const retries = detectModeRetries(params.max_gap_seconds);
+    return {
+      content: [{ type: "text", text: JSON.stringify(retries, null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "voiceos_ai_transforms",
+  "Compare transcript (what user said) vs generated_text (what was output). Categorizes each session as: passthrough (identical), ai_transformed (AI rewrote it), or no_output. Reveals where AI adds value vs just echoing.",
+  {},
+  async () => {
+    const transforms = detectAiTransforms();
+    return {
+      content: [{ type: "text", text: JSON.stringify(transforms, null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "voiceos_window_contexts",
+  "Analyze window titles to understand what the user was working on during voice sessions. Extracts URLs, file paths, and groups sessions by context. Reveals situation-specific automation opportunities.",
+  {},
+  async () => {
+    const contexts = analyzeWindowContexts();
+    return {
+      content: [{ type: "text", text: JSON.stringify(contexts, null, 2) }],
+    };
+  }
+);
+
+server.tool(
   "voiceos_custom_instructions",
   "Read user-defined per-app custom instructions. These reveal what the user has explicitly configured for specific apps.",
   {},
@@ -234,6 +277,9 @@ const ANALYSIS_GUIDE = `# VoiceOS Log Analyzer — 分析ガイド
 - 頻出アプリ → \`voiceos_app_usage\` で transcript を全件読む
 - エラーが多い → \`voiceos_error_patterns\` で原因を特定
 - 連続操作 → \`voiceos_session_sequences\` でマルチステップを発見
+- モードやり直し → \`voiceos_mode_retries\` で dictate→write 等のリトライを検出
+- AI加工パターン → \`voiceos_ai_transforms\` で口述そのまま vs AI 変換を分類
+- 作業コンテキスト → \`voiceos_window_contexts\` でURL/ファイルパス別の使い方を分析
 
 ### Step 3: 具体的なセッションを精査
 - \`voiceos_search_transcripts\` でキーワード検索
